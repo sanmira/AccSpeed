@@ -15,6 +15,4 @@ target_sources(app PRIVATE src/main.c)
 zephyr_include_directories(src)
 
 include_directories(src/orientation_detector)
-target_sources(app PRIVATE src/aggregator.c)
-target_sources(app PRIVATE src/alarm.c)
 target_sources(app PRIVATE src/ble.c)

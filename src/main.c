@@ -17,7 +17,13 @@
 #include <modem/nrf_modem_lib.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/drivers/i2c.h>
-#include <zephyr/drivers/spi.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/storage/disk_access.h>
+#include <zephyr/fs/fs.h>
+#include <ff.h>
+#include <zephyr/fs/fs_interface.h>
+
+#define NRF_SPI_DRV_MISO_N
 
 #include "ble.h"
 
@@ -27,43 +33,22 @@ struct device* i2c_accel;
 uint8_t WhoAmI = 0u;
 #define I2C_ACCEL_ADDR (0x19)
 static struct k_work_delayable acc_fifo_h_loop;
-bool spi_send_in_progress = false;
 
-
-static struct device* spi_slave_dev;
 struct device* gpio_dev;
 static struct gpio_callback acc_int_callback;
+static const char* disk_mount_pt = "/SD:";
 
 int16_t tx_buffer[31] = { 0 };
 int16_t rx_buffer[31] = { 0 };
 
-const struct spi_buf tx_buf = {
-	.buf = tx_buffer,
-	.len = sizeof(tx_buffer),
+static FATFS fat_fs;
+/* mounting info */
+static struct fs_mount_t mp = {
+	.type = FS_FATFS,
+	.fs_data = &fat_fs,
 };
 
-const struct spi_buf_set tx = {
-	.buffers = &tx_buf,
-	.count = 1,
-};
-
-const struct spi_buf rx_buf = {
-	.buf = rx_buffer,
-	.len = sizeof(rx_buffer),
-};
-
-const struct spi_buf_set rx = {
-	.buffers = &rx_buf,
-	.count = 1,
-};
-
-static const struct spi_config spi_cfg = {
-	.operation = SPI_WORD_SET(8) | SPI_TRANSFER_MSB | SPI_OP_MODE_SLAVE | SPI_MODE_CPOL | SPI_MODE_CPHA,
-	.frequency = 8000000,
-	.slave = 0,
-};
-
-static struct k_poll_signal spi_done_sig = K_POLL_SIGNAL_INITIALIZER(spi_done_sig);
+static int lsdir(const char *path);
 
 /* Interval in milliseconds between each time status LEDs are updated. */
 #define LEDS_UPDATE_INTERVAL K_MSEC(500)
@@ -103,7 +88,7 @@ enum
 static atomic_val_t association_requested;
 
 /* GNSS data */
-static struct nrf_modem_gnss_pvt_data_frame pvt_data = {0};
+static struct nrf_modem_gnss_pvt_data_frame pvt_data = { 0 };
 
 /* Structures for work */
 static struct k_work_delayable leds_update_work;
@@ -120,14 +105,14 @@ static void gnss_event_handler(int event_id)
 {
 	int err;
 
-	struct nrf_modem_gnss_nmea_data_frame *nmea_data;
+	struct nrf_modem_gnss_nmea_data_frame* nmea_data;
 	/* Process event */
 	switch (event_id)
 	{
 	case NRF_MODEM_GNSS_EVT_PVT:
 		/* Read PVT data */
 		err = nrf_modem_gnss_read(&pvt_data, sizeof(pvt_data),
-								  NRF_MODEM_GNSS_DATA_PVT);
+			NRF_MODEM_GNSS_DATA_PVT);
 		break;
 	case NRF_MODEM_GNSS_EVT_BLOCKED:
 		printk("GNSS Service blocked!\n");
@@ -237,13 +222,6 @@ static void acc_int_handler(const struct device* port, struct gpio_callback* cb,
 	k_work_schedule(&acc_fifo_h_loop, K_NO_WAIT);
 }
 
-void spi_slave_callback(const struct device* dev, int result, void* data)
-{
-	// printk("SPI transmitted: %d\r\n", result);
-	gpio_pin_set(gpio_dev, 9, 0);
-	spi_send_in_progress = false;
-}
-
 void acc_fifo_h_loop_fn()
 {
 	// LOG_INF("ACC INT Triggered");
@@ -286,27 +264,16 @@ void acc_fifo_h_loop_fn()
 
 	// printk("\r\n");
 
-	if (!spi_send_in_progress)
-	{
-		// printk("Sending...\r\n");
-		int err = spi_transceive_cb(spi_slave_dev, &spi_cfg, &tx, &rx, spi_slave_callback, NULL);
-		if (err != 0)
-		{
-			LOG_ERR("SPI error: %d", err);
-		}
-
-		spi_send_in_progress = true;
-		gpio_pin_set(gpio_dev, 9, 1);
-		if (!led_state)
-		{
-			dk_set_leds_state(0x01, DK_LED1_MSK);
-		}
-		else
-		{
-			dk_set_leds_state(0x00, DK_LED1_MSK);
-		}
-		led_state = !led_state;
-	}
+	// 	if (!led_state)
+	// 	{
+	// 		dk_set_leds_state(0x01, DK_LED1_MSK);
+	// 	}
+	// 	else
+	// 	{
+	// 		dk_set_leds_state(0x00, DK_LED1_MSK);
+	// 	}
+	// 	led_state = !led_state;
+	// }
 }
 
 /**@brief Update LEDs state. */
@@ -424,24 +391,67 @@ void main(void)
 		LOG_ERR("GPIO pin10 IN counfiguration failed");
 	}
 
-	err = gpio_pin_configure(gpio_dev, 9, GPIO_OUTPUT_INACTIVE | GPIO_ACTIVE_HIGH);
-	if (err)
-	{
-		LOG_ERR("GPIO pin9 OUT counfiguration failed");
-	}
-
 	k_work_init_delayable(&acc_fifo_h_loop, acc_fifo_h_loop_fn);
 
 	gpio_init_callback(&acc_int_callback, acc_int_handler, BIT(10));
 	gpio_add_callback(gpio_dev, &acc_int_callback);
 	gpio_pin_interrupt_configure(gpio_dev, 10, GPIO_INT_EDGE_RISING);
 
-	spi_slave_dev = DEVICE_DT_GET(DT_NODELABEL(spi3));
+	static const char* disk_pdrv = "SD";
+	uint64_t memory_size_mb;
+	uint32_t block_count;
+	uint32_t block_size;
 
-	if (!device_is_ready(spi_slave_dev))
+	err = disk_access_init(disk_pdrv);
+	if (err != 0)
 	{
-		LOG_ERR("SPI3 is not ready");
+		LOG_ERR("Storage init ERROR!: %d", err);
 	}
+
+	if (disk_access_ioctl(disk_pdrv, DISK_IOCTL_GET_SECTOR_COUNT, &block_count))
+	{
+		LOG_ERR("Unable to get sector count");
+	}
+	LOG_INF("Block count %u", block_count);
+
+	if (disk_access_ioctl(disk_pdrv, DISK_IOCTL_GET_SECTOR_SIZE, &block_size))
+	{
+		LOG_ERR("Unable to get sector size");
+	}
+	printk("Sector size %u\n", block_size);
+
+	memory_size_mb = (uint64_t)block_count * block_size;
+	printk("Memory Size(MB) %u\n", (uint32_t)(memory_size_mb >> 20));
+
+	mp.mnt_point = disk_mount_pt;
+
+	int res = fs_mount(&mp);
+
+	if (res == FR_OK) {
+		printk("Disk mounted.\n");
+		lsdir(disk_mount_pt);
+	} else {
+		printk("Error mounting disk.\n");
+	}
+
+	const uint8_t* test_data = "Hello from nrf9160dk!\r\n";
+	
+	struct fs_file_t fp;
+	res = fs_open(&fp, "/SD:/test.txt", FA_READ | FA_WRITE | FA_OPEN_APPEND);
+	if (res == FR_OK) {
+		printk("File opened\r\n");
+	} else {
+		printk("Cannot open file %d\r\n", res);
+	}
+
+	res = fs_write(&fp, test_data, strlen(test_data));
+	if (res >= 0) {
+		printk("Data written successfully\r\n");
+	} else {
+		printk("Cannot write data\r\n");
+	}
+
+	fs_close(&fp);
 
 	printk("GNSS sample has started\n");
 
@@ -510,4 +520,43 @@ void main(void)
 	}
 
 	printk("WhoAmI = 0x%02X\r\n", WhoAmI);
+}
+
+static int lsdir(const char *path)
+{
+	int res;
+	struct fs_dir_t dirp;
+	static struct fs_dirent entry;
+
+	fs_dir_t_init(&dirp);
+
+	/* Verify fs_opendir() */
+	res = fs_opendir(&dirp, path);
+	if (res) {
+		printk("Error opening dir %s [%d]\n", path, res);
+		return res;
+	}
+
+	printk("\nListing dir %s ...\n", path);
+	for (;;) {
+		/* Verify fs_readdir() */
+		res = fs_readdir(&dirp, &entry);
+
+		/* entry.name[0] == 0 means end-of-dir */
+		if (res || entry.name[0] == 0) {
+			break;
+		}
+
+		if (entry.type == FS_DIR_ENTRY_DIR) {
+			printk("[DIR ] %s\n", entry.name);
+		} else {
+			printk("[FILE] %s (size = %zu)\n",
+				entry.name, entry.size);
+		}
+	}
+
+	/* Verify fs_closedir() */
+	fs_closedir(&dirp);
+
+	return res;
 }

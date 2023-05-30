@@ -59,19 +59,17 @@
 
 	spi3_default: spi3_default {
 		group1 {
-			psels = <NRF_PSEL(SPIS_SCK, 0, 13)>,
-				<NRF_PSEL(SPIS_MISO, 0, 12)>,
-				<NRF_PSEL(SPIS_MOSI, 0, 11)>,
-				<NRF_PSEL(SPIS_CSN, 0, 16)>;
+			psels = <NRF_PSEL(SPIM_SCK, 0, 13)>,
+				<NRF_PSEL(SPIM_MISO, 0, 12)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 11)>;
 		};
 	};
 
 	spi3_sleep: spi3_sleep {
 		group1 {
-			psels = <NRF_PSEL(SPIS_SCK, 0, 13)>,
-				<NRF_PSEL(SPIS_MISO, 0, 12)>,
-				<NRF_PSEL(SPIS_MOSI, 0, 11)>,
-				<NRF_PSEL(SPIS_CSN, 0, 16)>;
+			psels = <NRF_PSEL(SPIM_SCK, 0, 13)>,
+				<NRF_PSEL(SPIM_MISO, 0, 12)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 11)>;
 			low-power-enable;
 		};
 	};
@@ -91,10 +89,20 @@
 };
 
 &spi3 {
-	compatible = "nordic,nrf-spis";
+	compatible = "nordic,nrf-spim";
 	status = "okay";
+	cs-gpios = <&gpio0 16 GPIO_ACTIVE_LOW>;
 	pinctrl-0 = <&spi3_default>;
 	pinctrl-1 = <&spi3_sleep>;
 	pinctrl-names = "default", "sleep";
-	def-char = <0xFF>;
+	sdhc0: sdhc@0 {
+		compatible = "zephyr,sdhc-spi-slot";
+		reg = <0>;
+		status = "okay";
+		sdmmc-disk {
+			compatible = "zephyr,sdmmc-disk";
+			status = "okay";
+		};
+		spi-max-frequency = <8000000>;
+	};
 };
